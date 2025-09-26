@@ -119,36 +119,12 @@ fn main() {
 
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-        let sysroot_output = cc::Build::new()
-            .get_compiler()
-            .to_command()
-            .arg("--print-sysroot")
-            .output()
-            .expect("Failed to execute command");
-        let sysroot: Option<PathBuf> = match sysroot_output.status.success() {
-            true => Some(
-                String::from_utf8(sysroot_output.stdout)
-                    .expect("Failed to parse sysroot")
-                    .trim()
-                    .into(),
-            ),
-            false => None,
-        };
-        let multi_dir_output = cc::Build::new()
-            .get_compiler()
-            .to_command()
-            .arg("--print-multi-directory")
-            .output()
-            .expect("Failed to execute command");
-        let multi_dir: Option<PathBuf> = match multi_dir_output.status.success() {
-            true => Some(
-                String::from_utf8(multi_dir_output.stdout)
-                    .expect("Failed to parse multi-dir")
-                    .trim()
-                    .into(),
-            ),
-            false => None,
-        };
+        let target_triple = env::var("TARGET").unwrap();
+        let is_cross_compiling = target_triple != env::var("HOST").unwrap();
+
+        // For zigbuild, we let Zig handle the cross-compilation toolchain
+        let sysroot: Option<PathBuf> = None;
+        let multi_dir: Option<PathBuf> = None;
         generate_bindings(
             sysroot.as_ref(),
             &[PathBuf::from("iree").join("runtime").join("api.h")],
@@ -158,7 +134,7 @@ fn main() {
 
         // The build process requires runtime tools: iree-flatcc-cli and generate_embed_data
         // So there has to be a host tool build before the actual runtime build in no-std builds.
-        #[cfg(not(feature = "std"))]
+        // #[cfg(not(feature = "std"))]
         {
             let mut host_config = cmake::Config::new(&iree_path);
 
@@ -178,15 +154,49 @@ fn main() {
             // TODO: Change this once cmake-rs supports multiple targets
             host_config
                 .target(&std::env::var("HOST").unwrap())
-                .build_target("iree-flatcc-cli")
                 .out_dir(&build_path.join("host"));
-            host_config.build();
-            host_config.build_target("generate_embed_data").build();
+
+            // Build iree-flatcc-cli first
+            host_config.build_target("iree-flatcc-cli").build();
+
+            // Build iree-c-embed-data separately
+            let mut host_config2 = cmake::Config::new(&iree_path);
+            cmake_host_defs.iter().for_each(|(k, v)| {
+                host_config2.define(k, v);
+            });
+            host_config2
+                .target(&std::env::var("HOST").unwrap())
+                .build_target("iree-c-embed-data")
+                .out_dir(&build_path.join("host"))
+                .build();
         }
-        #[cfg(not(feature = "std"))]
+        // #[cfg(not(feature = "std"))]
         let host_bin_dir = build_path.join("host/build/tools");
 
         let mut config = cmake::Config::new(iree_path);
+
+        // Configure CMake for Zig cross-compilation
+        if is_cross_compiling {
+            config.define("CMAKE_SYSTEM_NAME", "Linux");
+
+            // Set Zig as the compiler for cross-compilation
+            if let Ok(zig_cc) = env::var("CC") {
+                config.define("CMAKE_C_COMPILER", zig_cc);
+            }
+            if let Ok(zig_cxx) = env::var("CXX") {
+                config.define("CMAKE_CXX_COMPILER", zig_cxx);
+            }
+
+            // Set architecture based on target
+            if target_triple.starts_with("aarch64") {
+                config.define("CMAKE_SYSTEM_PROCESSOR", "aarch64");
+            } else if target_triple.starts_with("x86_64") {
+                config.define("CMAKE_SYSTEM_PROCESSOR", "x86_64");
+            }
+
+            // Point to the host tools we built earlier
+            config.define("IREE_HOST_BIN_DIR", host_bin_dir.to_str().unwrap());
+        }
 
         // CMake config for IREE runtime build
         let mut cmake_defs = vec![
@@ -272,25 +282,35 @@ fn main() {
             .out_dir(&build_path);
 
         // Build IREE runtime
-        config.build();
+        let cmake_build_path = config.build();
 
         // The IREE runtime is compiled as static library, and it requires iree_runtime_unified,
         // flatcc_parsing, and platform-specific libraries. When cross-compiling, lld is
         // recommended.
         println!(
             "cargo:rustc-link-search={}",
-            build_path.join("build/runtime/src/iree/runtime").display()
+            cmake_build_path
+                .join("build/runtime/src/iree/runtime")
+                .display()
         );
         println!(
             "cargo:rustc-link-search={}",
-            build_path
+            cmake_build_path
                 .join("build/build_tools/third_party/flatcc")
                 .display()
         );
 
         // Print order is important.
-        println!("cargo:rustc-link-lib=iree_runtime_unified");
-        println!("cargo:rustc-link-lib=flatcc_parsing");
+        println!("cargo:rustc-link-lib=static=iree_runtime_unified");
+        println!("cargo:rustc-link-lib=static=flatcc_parsing");
+
+        // Check if cpuinfo library exists and link it if it does
+        let cpuinfo_path = cmake_build_path.join("build/third_party/cpuinfo");
+        let cpuinfo_lib = cpuinfo_path.join("libcpuinfo.a");
+        if cpuinfo_lib.exists() {
+            println!("cargo:rustc-link-search={}", cpuinfo_path.display());
+            println!("cargo:rustc-link-lib=static=cpuinfo");
+        }
 
         match target_os.as_str() {
             "linux" => {
